@@ -1,0 +1,171 @@
+1. Запустить nginx на нестандартном порту 3-мя разными способами.
+  1. переключатели setsebool:
+    Для начала установить веб-сервер nginx командой yum install -y nginx
+    Заходим в файл конфигурации nginx и меняем порт на 10001 - vim /etc/nginx/nginx.conf. Запустить на таком порту веб-сервер не получается.
+    Далее выполняем команду audit2why < /var/log/audit/audit.log, для того чтобы понять какой логический тип включать
+    Утилита audit2why рекомендует выполнить команду setsebool -P nis_enabled 1, ключ -P сохранит правило и после перезагрузки. Выполняем команду без ключа -P.
+    После этого веб-сервер nginx успешно запускается
+
+  2. добавление нестандартного порта в имеющийся тип:
+    Выполняем команду для того чтобы посмотреть какие порты могут работать по протоколу http - semanage port -l | grep http. Видим что нашего порта 10001 там нет
+    Добавляем наш нестандартный порт в правило политики, командой - semanage port -a -t http_port_t -p tcp 10001. Удалить semanage port -d -t http_port_t -p tcp 10001
+    Теперь веб-сервер nginx запускается на нашем нестандартном порту.
+
+  3. формирование и установка модуля SELinux:
+    Для этого нам необходимо будет скомпилировать модуль на основе лог файла аудита, в котором есть информация о запретах.
+    Выполним команду audit2allow -M httpd_add --debug < /var/log/audit/audit.log:
+   
+[root@ex vagrant]# audit2allow -M httpd_add --debug < /var/log/audit/audit.log
+******************** IMPORTANT ***********************
+To make this policy package active, execute:
+
+semodule -i httpd_add.pp
+
+[root@ex vagrant]# ls -l 
+total 8
+-rw-r--r--. 1 root root 964 Jan 17 22:45 httpd_add.pp
+-rw-r--r--. 1 root root 261 Jan 17 22:45 httpd_add.te
+
+    Далее происталлируем наш созданный модуль - semodule -i httpd_add.pp
+    Проверяем загрузился ли наш модуль:
+
+[root@ex vagrant]# semodule -l | grep http
+httpd_add	1.0
+
+    Наш веб-сервер теперь снова работает на нашем порту 10001.
+    Чтобы удалить модуль, надо выполнить команду semodule -r httpd_add. Чтобы выключить модуль semodule -d -v httpd_add. Включить модуль semodule -e -v httpd_add
+
+
+2. Обеспечить работоспособность приложения при включенном selinux
+
+ Скачиваем данные из репозитория git clone https://github.com/mbfx/otus-linux-adm.git
+ Запускаем наши виртуальные машины командой vagrant up
+ Подключаемся к клиентской машине vagrant ssh client и пробуем выполнить команды:
+
+nsupdate -k /etc/named.zonetransfer.key
+server 192.168.50.10
+zone ddns.lab 
+update add www.ddns.lab. 60 A 192.168.50.15
+send
+
+ Получаем ошибку update failed: SERVFAIL
+
+
+ Для того чтобы решить эту задачу необходимо создать некоторое количество модулей по конкретным ошибкам (потому как решаем одну ошибку SELINUX то появляется другая) на DNS сервере, которые описываются в файлах /var/log/audit/audit.log и /var/log/messages, а также для отлавнивания ошибок я использовал systemctl status named, после пе резапуска процесса BIND сервера, там также отображаются ошибки.
+
+ Как решал проблему:
+
+ Нам нужно убрать все исключения и ошибки по линии SELINUX, чтобы система безопасности перестала ругаться
+ выполняем команду audit2why < /var/log/audit/audit.log и видим:
+
+############################################################################################
+
+audit2why < /var/log/audit/audit.log
+type=AVC msg=audit(1587231618.482:1955): avc:  denied  { search } for  pid=7268 comm="isc-worker0000" name="net" dev="proc" ino=33134 scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:sysctl_net_t:s0 tclass=dir permissive=0
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+
+type=AVC msg=audit(1587231618.482:1956): avc:  denied  { search } for  pid=7268 comm="isc-worker0000" name="net" dev="proc" ino=33134 scontext=system_u:system_r:named_t:s0 tcontext=system_u:object_r:sysctl_net_t:s0 tclass=dir permissive=0
+
+	Was caused by:
+		Missing type enforcement (TE) allow rule.
+
+		You can use audit2allow to generate a loadable module to allow this access.
+
+############################################################################################
+
+ Далее выполняем команду audit2allow -M named-selinux --debug < /var/log/audit/audit.log и semodule -i named-selinux.pp
+ Это не решает проблему, у нас начинают появляется новые ошибки:
+
+############################################################################################
+cat /var/log/messages | grep ausearch
+localhost python: SELinux is preventing /usr/sbin/named from search access on the directory net.#012#012*****  Plugin catchall (100. confidence) suggests   **************************#012#012If you believe that named should be allowed search access on the net directory by default.#012Then you should report this as a bug.#012You can generate a local policy module to allow this access.#012Do#012allow this access for now by executing:#012# ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000#012# semodule -i my-iscworker0000.pp#012
+############################################################################################
+
+
+ Здесь нам подсказывают что надо сделать чтобы SELinux перестал блокировать доступ, то нужно выполнить команду: ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000 | semodule -i my-iscworker0000.pp
+
+ Так как это тоже не решает проблему смотрим что надо дальше пишет лог /var/log/messages:
+############################################################################################
+localhost python: SELinux is preventing /usr/sbin/named from read access on the file ip_local_port_range.#012#012*****  Plugin catchall (100. confidence) suggests   **************************#012#012If you believe that named should be allowed read access on the ip_local_port_range file by default.#012Then you should report this as a bug.#012You can generate a local policy module to allow this access.#012Do#012allow this access for now by executing:#012# ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000#012# semodule -i my-iscworker0000.pp#012
+############################################################################################
+
+Здесь у файла DNS сервера нет доступа прочитать файл ip_local_port_range Здесь нам подсказывают что надо сделать чтобы SELinux перестал блокировать доступ к доступ то нужно выполнить команду: ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0001 | semodule -i my-iscworker0001.pp
+
+Это не помогает:
+############################################################################################
+localhost python: SELinux is preventing /usr/sbin/named from open access on the file /proc/sys/net/ipv4/ip_local_port_range.#012#012*****  Plugin catchall (100. confidence) suggests   **************************#012#012If you believe that named should be allowed open access on the ip_local_port_range file by default.#012Then you should report this as a bug.#012You can generate a local policy module to allow this access.#012Do#012allow this access for now by executing:#012# ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000#012# semodule -i my-iscworker0000.pp#012
+############################################################################################
+
+Здесь нам подсказывают что надо сделать чтобы SELinux перестал блокировать
+доступ, то нужно выполнить команду: ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0002 | semodule -i my-iscworker0002.pp
+
+Это не помогает:
+   
+############################################################################################
+localhost python: SELinux is preventing /usr/sbin/named from getattr access on the file /proc/sys/net/ipv4/ip_local_port_range.#012#012*****  Plugin catchall (100. confidence) suggests   **************************#012#012If you believe that named should be allowed getattr access on the ip_local_port_range file by default.#012Then you should report this as a bug.#012You can generate a local policy module to allow this access.#012Do#012allow this access for now by executing:#012# ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000#012# semodule -i my-iscworker0000.pp#012
+############################################################################################
+
+Здесь нам подсказывают что надо сделать чтобы SELinux перестал блокировать доступ, то нужно выполнить команду: ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0003 | semodule -i my-iscworker0003.pp
+
+Это не помогает:
+############################################################################################
+localhost python: SELinux is preventing isc-worker0000 from create access on the file named.ddns.lab.view1.jnl.#012#012*****  Plugin catchall_labels (83.8 confidence) suggests   *******************#012#012If you want to allow isc-worker0000 to have create access on the named.ddns.lab.view1.jnl file#012Then you need to change the label on named.ddns.lab.view1.jnl#012Do#012# semanage fcontext -a -t FILE_TYPE 'named.ddns.lab.view1.jnl'#012where FILE_TYPE is one of the following: dnssec_trigger_var_run_t, ipa_var_lib_t, krb5_host_rcache_t, krb5_keytab_t, named_cache_t, named_log_t, named_tmp_t, named_var_run_t, named_zone_t.#012Then execute:#012restorecon -v 'named.ddns.lab.view1.jnl'#012#012#012*****  Plugin catchall (17.1 confidence) suggests   **************************#012#012If you believe that isc-worker0000 should be allowed create access on the named.ddns.lab.view1.jnl file by default.#012Then you should report this as a bug.#012You can generate a local policy module to allow this access.#012Do#012allow this access for now by executing:#012# ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0000#012# semodule -i my-iscworker0000.pp#012
+############################################################################################
+
+Здесь нам подсказывают что надо сделать чтобы SELinux перестал блокировать доступ к доступ то нужно выполнить команду: ausearch -c 'isc-worker0000' --raw | audit2allow -M my-iscworker0004 | semodule -i my-iscworker0004.pp
+
+После чего в файле /var/log/messages перестают появляться, но ошибки есть в выводе команды systemctl status named:
+
+systemctl status named
+● named.service - Berkeley Internet Name Domain (DNS)
+   Loaded: loaded (/usr/lib/systemd/system/named.service; enabled; vendor preset: disabled)
+   Active: active (running) since Sat 2021-01-17 22:02:46 UTC; 4s ago
+  Process: 8015 ExecStop=/bin/sh -c /usr/sbin/rndc stop > /dev/null 2>&1 || /bin/kill -TERM $MAINPID (code=exited, status=0/SUCCESS)
+  Process: 8028 ExecStart=/usr/sbin/named -u named -c ${NAMEDCONF} $OPTIONS (code=exited, status=0/SUCCESS)
+  Process: 8026 ExecStartPre=/bin/bash -c if [ ! "$DISABLE_ZONE_CHECKING" == "yes" ]; then /usr/sbin/named-checkconf -z "$NAMEDCONF"; else echo "Checking of zone files is disabled"; fi (code=exited, status=0/SUCCESS)
+ Main PID: 8031 (named)
+   CGroup: /system.slice/named.service
+           └─8031 /usr/sbin/named -u named -c /etc/named.conf
+
+ns01 named[8031]: automatic empty zone: view default: HOME.ARPA
+ns01 named[8031]: none:104: 'max-cache-size 90%' - setting to 211MB (out of 235MB)
+ns01 named[8031]: command channel listening on 192.168.50.10#953
+ns01 named[8031]: managed-keys-zone/view1: journal file is out of date: removing journal file
+ns01 named[8031]: managed-keys-zone/view1: loaded serial 10
+ns01 named[8031]: managed-keys-zone/default: journal file is out of date: removing journal file
+ns01 named[8031]: managed-keys-zone/default: loaded serial 10
+ns01 named[8031]: zone 0.in-addr.arpa/IN/view1: loaded serial 0
+ns01 named[8031]: zone ddns.lab/IN/view1: journal rollforward failed: no more
+ns01 named[8031]: zone ddns.lab/IN/view1: not loaded due to errors.
+
+
+2. Удаляем файл /etc/named/dynamic/named.ddns.lab.view1.jnl, перезапускаем сервис DNS сервера systemctl restart named и больше не видим ошибок, теперь динамическое обновление выполняется успешно.
+
+systemctl status named
+● named.service - Berkeley Internet Name Domain (DNS)
+   Loaded: loaded (/usr/lib/systemd/system/named.service; enabled; vendor preset: disabled)
+   Active: active (running) since Sat 2021-01-11 22:05:44 UTC; 3min 38s ago
+  Process: 8057 ExecStop=/bin/sh -c /usr/sbin/rndc stop > /dev/null 2>&1 || /bin/kill -TERM $MAINPID (code=exited, status=0/SUCCESS)
+  Process: 8070 ExecStart=/usr/sbin/named -u named -c ${NAMEDCONF} $OPTIONS (code=exited, status=0/SUCCESS)
+  Process: 8068 ExecStartPre=/bin/bash -c if [ ! "$DISABLE_ZONE_CHECKING" == "yes" ]; then /usr/sbin/named-checkconf -z "$NAMEDCONF"; else echo "Checking of zone files is disabled"; fi (code=exited, status=0/SUCCESS)
+ Main PID: 8072 (named)
+   CGroup: /system.slice/named.service
+           └─8072 /usr/sbin/named -u named -c /etc/named.conf
+
+ns01 named[8072]: automatic empty zone: view default: 8.B.D.0.1.0.0.2.IP6.ARPA
+ns01 named[8072]: automatic empty zone: view default: EMPTY.AS112.ARPA
+named[8072]: automatic empty zone: view default: HOME.ARPA
+named[8072]: none:104: 'max-cache-size 90%' - setting to 211MB (out of 235MB)
+named[8072]: command channel listening on 192.168.50.10#953
+ns01 named[8072]: managed-keys-zone/view1: journal file is out of date: removing journal file
+ns01 named[8072]: managed-keys-zone/view1: loaded serial 11
+ns01 named[8072]: client @0x7f61fc09df00 192.168.50.15#26071/key zonetransfer.key: view view1: signer "zonetransfer.key" approved
+ns01 named[8072]: client @0x7f61fc09df00 192.168.50.15#26071/key zonetransfer.key: view view1: updating zone 'ddns.lab/IN': adding an RR at 'www.ddns.lab' A 192.168.50.15
+ns01 named[8072]: client @0x7f61fc09df00 192.168.50.15#26071/key zonetransfer.key: view view1: signer "zonetransfer.key" approved
+
+
+Причина неработоспособности механизма обновления заключается в том что Selinux блокировал доступ к обновлению файлов динамического обновления для DNS сервера, а также к некоторым файлам ОС, к которым DNS сервер (/usr/sbin/named) обращается во время своей работы (указаны выше, взяты из логов сервера). Кроме того рекомендуется удалить файл с расширением .jnl (или прописать контекст безопасности), куда записываются динамические обновления зоны. Так как прежде чем данные попадают в .jnl файл, они сначала записываются во временный файл tmp, для которого может срабатывать блокировка (как в моем случае), поэтому tmp файлы также рекомендуется или удалить или прописать им контекст безопасности.
